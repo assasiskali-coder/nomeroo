@@ -1,6 +1,5 @@
 import asyncio
 import os
-import re
 import aiohttp
 from datetime import datetime, date
 from aiogram import Bot, Dispatcher, types, F, Router
@@ -31,9 +30,6 @@ TGLION_YOUR_ID   = os.getenv("TGLION_YOUR_ID", "YOUR_TGLION_ID")
 TGLION_BASE      = "https://TG-Lion.net"
 ORDERS_CHANNEL   = os.getenv("ORDERS_CHANNEL", "-1001234567890")
 
-# HUMO bot Telegram ID — o'zgarmaydi
-HUMO_BOT_ID = 5537718006
-
 BLOCKED_COUNTRIES = {"CO", "NG", "ZW"}
 
 # ─── BOT SOZLASH ───────────────────────────────────────────────
@@ -49,9 +45,6 @@ db = Database()
 class PayStates(StatesGroup):
     wait_amount = State()
     wait_check  = State()
-
-class HumoPayStates(StatesGroup):
-    wait_amount = State()
 
 class BalanceChangeState(StatesGroup):
     wait_user_id = State()
@@ -131,36 +124,11 @@ async def api_get_code(number: str) -> dict:
     return await api_get("getCode", {"number": number})
 
 # ══════════════════════════════════════════════════════════════
-#  HUMO SMS ORQALI AVTOMATIK TO'LOV
+#  TO'LOVNI TASDIQLASH (faqat admin qo'lda tasdiqlaydi)
 # ══════════════════════════════════════════════════════════════
 
-def parse_humo_amount(text: str) -> int | None:
-    """
-    HUMO botidan kelgan SMS dan summani ajratib oladi.
-    Turli xil formatlarni qo'llab-quvvatlaydi.
-    """
-    patterns = [
-        r'\+?\s*([\d][\d\s]*[\d])[.,]?\d*\s*UZS',
-        r'([\d][\d\s]{3,})[.,]\d{2}\s*UZS',
-        r'Hisobingizga\s+([\d\s,]+)\s*UZS',
-        r'(\d{4,})\s*so\'?m',
-        r'summa[:\s]+([\d\s]+)',
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            raw = re.sub(r'[\s,]', '', match.group(1))
-            try:
-                amount = int(raw)
-                if 1000 <= amount <= 10_000_000:
-                    return amount
-            except:
-                continue
-    return None
-
-
-async def humo_confirm_payment(pay_id: str, user_id: int, amount: int, fullname: str):
-    """To'lovni tasdiqlaydi va xabar yuboradi."""
+async def confirm_payment(pay_id: str, user_id: int, amount: int, fullname: str):
+    """Adminning tasdig'idan so'ng balansga pul qo'shadi va xabar yuboradi."""
     await db.update_balance(user_id, amount)
     await db.update_total_deposited(user_id, amount)
     await db.delete_pending_payment(pay_id)
@@ -169,7 +137,7 @@ async def humo_confirm_payment(pay_id: str, user_id: int, amount: int, fullname:
     try:
         await bot.send_message(
             user_id,
-            f"✅ To'lovingiz tasdiqlandi!\n\n"
+            f"✅ Hisobingiz admin tomonidan to'ldirildi!\n\n"
             f"💰 Hisobingizga <b>{amount:,} so'm</b> qo'shildi!\n"
             f"💼 Joriy balans: <b>{user_balance:,} so'm</b>"
         )
@@ -180,7 +148,7 @@ async def humo_confirm_payment(pay_id: str, user_id: int, amount: int, fullname:
     try:
         await bot.send_message(
             ADMIN_ID,
-            f"✅ HUMO orqali to'lov avtomatik tasdiqlandi!\n\n"
+            f"✅ To'lov tasdiqlandi!\n\n"
             f"👤 {fullname} (<code>{user_id}</code>)\n"
             f"💰 +{amount:,} so'm\n"
             f"💼 Yangi balans: {user_balance:,} so'm\n"
@@ -188,90 +156,6 @@ async def humo_confirm_payment(pay_id: str, user_id: int, amount: int, fullname:
         )
     except:
         pass
-
-
-# ─── HUMO BOT XABARLARINI TINGLASH ────────────────────────────
-# XATO TUZATILDI: bu handler avval `router`da edi va F.forward_origin filtri
-# juda keng edi — oddiy foydalanuvchi istalgan xabarni forward qilsa, u xabar
-# "yutilib" ketardi (hech qanday javob qaytmasdi). Endi u faqat admin_router
-# ichida, va filtrning o'zida ADMIN_ID tekshiriladi — shu bilan oddiy
-# foydalanuvchilarning /start va boshqa xabarlariga hech qanday ta'sir qilmaydi.
-@admin_router.message(F.forward_origin, F.from_user.id == ADMIN_ID)
-async def humo_forward_handler(msg: Message):
-    """
-    Admin chatida @HUMOcardbot dan forward xabar kelsa — avtomatik tasdiqlanadi.
-    Mijozga bu jarayon ko'rinmaydi.
-    """
-    # Forward qilingan xabar HUMO botdan ekanini tekshirish
-    origin = msg.forward_origin
-    sender_id = None
-    if hasattr(origin, 'sender_user') and origin.sender_user:
-        sender_id = origin.sender_user.id
-    elif hasattr(origin, 'sender_chat') and origin.sender_chat:
-        sender_id = origin.sender_chat.id
-
-    if sender_id != HUMO_BOT_ID:
-        return  # Boshqa forward — e'tibor bermaymiz
-
-    text = msg.text or msg.caption or ""
-    amount = parse_humo_amount(text)
-
-    if not amount:
-        await msg.answer(
-            f"⚠️ HUMO SMS keldi, lekin summa aniqlanmadi.\n"
-            f"Qo'lda: <code>/addbal USER_ID SUMMA</code>"
-        )
-        return
-
-    pending_list = await db.find_pending_by_amount(amount)
-
-    if not pending_list:
-        await msg.answer(
-            f"💰 HUMO: <b>{amount:,} so'm</b> keldi.\n"
-            f"❌ Mos kutayotgan to'lov topilmadi.\n\n"
-            f"Qo'lda: <code>/addbal USER_ID {amount}</code>"
-        )
-        return
-
-    if len(pending_list) == 1:
-        pay = pending_list[0]
-        await humo_confirm_payment(pay["pay_id"], pay["user_id"], amount, pay["fullname"])
-        await msg.answer(f"✅ Avtomatik tasdiqlandi! {pay['fullname']} → +{amount:,} so'm")
-    else:
-        # Bir nechta mos — admin tanlaydi
-        buttons = []
-        for pay in pending_list:
-            buttons.append([InlineKeyboardButton(
-                text=f"👤 {pay['fullname']} — {pay['amount']:,} so'm",
-                callback_data=f"humo_pick:{pay['pay_id']}:{amount}"
-            )])
-        buttons.append([InlineKeyboardButton(text="❌ Bekor qilish", callback_data="humo_cancel")])
-        await msg.answer(
-            f"💰 HUMO: <b>{amount:,} so'm</b> — kimga tasdiqlaysiz?",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
-        )
-
-
-@admin_router.callback_query(F.data.startswith("humo_pick:"))
-async def humo_pick_cb(call: CallbackQuery):
-    if call.from_user.id != ADMIN_ID:
-        return
-    _, pay_id, amount_str = call.data.split(":", 2)
-    amount = int(amount_str)
-    pay = await db.get_pending_payment(pay_id)
-    if not pay:
-        return await call.answer("❌ Allaqachon tasdiqlangan!", show_alert=True)
-    await humo_confirm_payment(pay["pay_id"], pay["user_id"], amount, pay["fullname"])
-    await call.message.edit_text(f"✅ {pay['fullname']} → +{amount:,} so'm tasdiqlandi!")
-    await call.answer()
-
-
-@admin_router.callback_query(F.data == "humo_cancel")
-async def humo_cancel_cb(call: CallbackQuery):
-    if call.from_user.id != ADMIN_ID:
-        return
-    await call.message.edit_text("❌ Bekor qilindi.")
-    await call.answer()
 
 
 # ─── ADMIN BUYRUQ: QO'LDA BALANS QO'SHISH ─────────────────────
@@ -295,23 +179,23 @@ async def addbal_cmd(msg: Message):
     await msg.answer(f"✅ {user['fullname']} ga {amount:,} so'm qo'shildi. Yangi balans: {bal:,} so'm")
 
 # ══════════════════════════════════════════════════════════════
-#  HISOB TO'LDIRISH — HUMO USLUBI (rasmga o'xshash)
+#  HISOB TO'LDIRISH — QO'LDA, ADMIN TASDIQLAYDI (avto to'lov yo'q)
 # ══════════════════════════════════════════════════════════════
 
 @router.message(F.text == "💳 Hisob To'ldirish")
 async def topup_menu(msg: Message, state: FSMContext):
     await msg.answer(
         "💳 <b>Hisob To'ldirish</b>\n\n"
-        "Necha so'm to'lamoqchisiz?\n\n"
+        "⚠️ To'lov qilishdan oldin summaga e'tiborli bo'ling, botda qolgan pul qaytarib berilmaydi!\n\n"
+        "💵 Qancha miqdorda pul to'lamoqchisiz? (so'mda, faqat son kiriting)\n\n"
         "📌 Minimal: <b>1 000 so'm</b>\n"
-        "📌 Maksimal: <b>10 000 000 so'm</b>\n\n"
-        "Faqat son kiriting:"
+        "📌 Maksimal: <b>10 000 000 so'm</b>"
     )
-    await state.set_state(HumoPayStates.wait_amount)
+    await state.set_state(PayStates.wait_amount)
 
 
-@router.message(HumoPayStates.wait_amount)
-async def humo_pay_amount(msg: Message, state: FSMContext):
+@router.message(PayStates.wait_amount)
+async def pay_amount_received(msg: Message, state: FSMContext):
     if not msg.text or not msg.text.strip().isdigit():
         await msg.answer("❌ Faqat raqam kiriting!")
         return
@@ -325,35 +209,29 @@ async def humo_pay_amount(msg: Message, state: FSMContext):
         )
         return
 
-    await state.clear()
-
     user_id  = msg.from_user.id
     fullname = msg.from_user.full_name
 
     # Pending payment yaratish
-    pay_id = f"humo_{user_id}_{amount}_{msg.message_id}"
+    pay_id = f"pay_{user_id}_{amount}_{msg.message_id}"
     await db.add_pending_payment(pay_id, user_id, amount, fullname)
 
-    card   = await get_setting("card_number", CARD_NUMBER)
-    owner  = await get_setting("card_owner", CARD_OWNER)
+    card  = await get_setting("card_number", CARD_NUMBER)
+    owner = await get_setting("card_owner", CARD_OWNER)
 
-    # Rasmga o'xshash UI
+    await state.update_data(pay_id=pay_id, pay_amount=amount)
+    await state.set_state(PayStates.wait_check)
+
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏧 Kartani raqamni Nusxa olish", callback_data=f"copy_card:{card}")],
-        [InlineKeyboardButton(text="💸 To'lov miqdorni Nusxa olish", callback_data=f"copy_amount:{amount}")],
         [InlineKeyboardButton(text="❌ Bekor qilish", callback_data=f"cancel_pay:{pay_id}")],
     ])
 
     await msg.answer(
-        f"✅ <b>To'lov miqdori qabul qilindi!</b>\n\n"
-        f"💸 To'lashingiz kerak: <b>{amount:,} so'm</b>\n"
-        f"🏧 Karta Egasi: <b>{owner}</b>\n"
-        f"💳 Karta: <b>{card}</b>\n\n"
-        f"👆 Ushbu tepadagi kartaga siz istalgan to'lov tizimi orqali <b>{amount:,} so'm</b> to'ling! "
-        f"Undan 1 tiyin ko'p ham kam ham to'lov qilmang faqat belgilangan miqdorda to'lov qiling "
-        f"va pul sizning hisobingizga avtomatik tushurib beriladi!\n\n"
-        f"⚠️ <i>Diqqat: 5 daqiqa ichida to'lov qilmasangiz to'lovingiz qabul qilinmaydi!!!</i>\n\n"
-        f"✅ To'lovni bajaring va to'lov avtomatik 1-2 daqiqa ichida tasdiqlanadi!",
+        f"💸 To'lov miqdori: <b>{amount:,} so'm</b>\n"
+        f"💳 Karta raqami: <code>{card}</code>\n"
+        f"👤 Karta egasi: <b>{owner}</b>\n\n"
+        f"Yuqoridagi karta raqamiga to'lov qiling, so'ng to'lov chekini (skrinshotini) shu yerga yuboring.\n\n"
+        f"⚠️ <i>Diqqat: 5 daqiqa ichida chek yubormasangiz, to'lov bekor qilinadi.</i>",
         reply_markup=kb
     )
 
@@ -377,24 +255,103 @@ async def _pay_timeout(pay_id: str, user_id: int, amount: int):
             pass
 
 
-@router.callback_query(F.data.startswith("copy_card:"))
-async def copy_card_cb(call: CallbackQuery):
-    card = call.data.split(":", 1)[1]
-    await call.answer(f"✅ Karta raqami: {card}", show_alert=True)
+@router.message(PayStates.wait_check, F.photo)
+async def pay_check_received(msg: Message, state: FSMContext):
+    """Foydalanuvchi to'lov chekini (skrinshot) yuboradi — admin qo'lda tasdiqlaydi."""
+    data   = await state.get_data()
+    pay_id = data.get("pay_id")
+    pay    = await db.get_pending_payment(pay_id) if pay_id else None
+
+    if not pay:
+        await msg.answer(
+            "❌ Bu to'lovning muddati o'tgan yoki bekor qilingan.\n"
+            "Qaytadan '💳 Hisob To'ldirish' tugmasini bosing."
+        )
+        await state.clear()
+        return
+
+    photo_id = msg.photo[-1].file_id
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"pay_ok:{pay_id}"),
+        InlineKeyboardButton(text="❌ Rad etish",  callback_data=f"pay_no:{pay_id}"),
+    ]])
+
+    try:
+        await bot.send_photo(
+            ADMIN_ID,
+            photo_id,
+            caption=(
+                f"🧾 <b>Yangi to'lov cheki!</b>\n\n"
+                f"👤 {pay['fullname']} (<code>{pay['user_id']}</code>)\n"
+                f"💰 Miqdor: <b>{pay['amount']:,} so'm</b>"
+            ),
+            reply_markup=kb
+        )
+    except Exception:
+        await msg.answer("❌ Chekni yuborishda xatolik yuz berdi. Qayta urinib ko'ring.")
+        return
+
+    await msg.answer(
+        "✅ Chekingiz adminga yuborildi. Tasdiqlashini kuting.",
+        reply_markup=main_menu
+    )
+    await state.clear()
 
 
-@router.callback_query(F.data.startswith("copy_amount:"))
-async def copy_amount_cb(call: CallbackQuery):
-    amount = call.data.split(":", 1)[1]
-    await call.answer(f"✅ To'lov miqdori: {int(amount):,} so'm", show_alert=True)
+@router.message(PayStates.wait_check)
+async def pay_check_wrong_type(msg: Message):
+    await msg.answer("📸 Iltimos, to'lov chekining rasmini (skrinshotini) yuboring!")
+
+
+@admin_router.callback_query(F.data.startswith("pay_ok:"))
+async def pay_ok_cb(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    pay_id = call.data.split(":", 1)[1]
+    pay = await db.get_pending_payment(pay_id)
+    if not pay:
+        return await call.answer("❌ Bu to'lov allaqachon ko'rib chiqilgan!", show_alert=True)
+
+    await confirm_payment(pay["pay_id"], pay["user_id"], pay["amount"], pay["fullname"])
+    try:
+        await call.message.edit_caption(caption=(call.message.caption or "") + "\n\n✅ Tasdiqlandi!")
+    except TelegramBadRequest:
+        pass
+    await call.answer("✅ Tasdiqlandi!")
+
+
+@admin_router.callback_query(F.data.startswith("pay_no:"))
+async def pay_no_cb(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    pay_id = call.data.split(":", 1)[1]
+    pay = await db.get_pending_payment(pay_id)
+    if not pay:
+        return await call.answer("❌ Bu to'lov allaqachon ko'rib chiqilgan!", show_alert=True)
+
+    await db.delete_pending_payment(pay_id)
+    try:
+        await bot.send_message(
+            pay["user_id"],
+            f"❌ <b>{pay['amount']:,} so'm</b>lik to'lovingiz rad etildi.\n"
+            f"Agar bu xato deb hisoblasangiz, qo'llab-quvvatlash xizmatiga murojaat qiling."
+        )
+    except:
+        pass
+    try:
+        await call.message.edit_caption(caption=(call.message.caption or "") + "\n\n❌ Rad etildi!")
+    except TelegramBadRequest:
+        pass
+    await call.answer("❌ Rad etildi!")
 
 
 @router.callback_query(F.data.startswith("cancel_pay:"))
-async def cancel_pay_cb(call: CallbackQuery):
+async def cancel_pay_cb(call: CallbackQuery, state: FSMContext):
     pay_id = call.data.split(":", 1)[1]
     pay = await db.get_pending_payment(pay_id)
     if pay:
         await db.delete_pending_payment(pay_id)
+    await state.clear()
     await call.message.edit_text("❌ To'lov bekor qilindi.")
     await call.answer()
 
@@ -591,12 +548,12 @@ async def show_balance(msg: Message):
 async def goto_topup(call: CallbackQuery, state: FSMContext):
     await call.message.answer(
         "💳 <b>Hisob To'ldirish</b>\n\n"
-        "Necha so'm to'lamoqchisiz?\n\n"
+        "⚠️ To'lov qilishdan oldin summaga e'tiborli bo'ling, botda qolgan pul qaytarib berilmaydi!\n\n"
+        "💵 Qancha miqdorda pul to'lamoqchisiz? (so'mda, faqat son kiriting)\n\n"
         "📌 Minimal: <b>1 000 so'm</b>\n"
-        "📌 Maksimal: <b>10 000 000 so'm</b>\n\n"
-        "Faqat son kiriting:"
+        "📌 Maksimal: <b>10 000 000 so'm</b>"
     )
-    await state.set_state(HumoPayStates.wait_amount)
+    await state.set_state(PayStates.wait_amount)
     await call.answer()
 
 # ─── NOMER OLISH ───────────────────────────────────────────────
