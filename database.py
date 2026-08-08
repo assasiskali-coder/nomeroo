@@ -81,10 +81,26 @@ class Database:
                     price        BIGINT NOT NULL
                 )
             """)
-            # Foydalanuvchi /start bosgan zahoti referal ID shu yerga yoziladi.
-            # FSM holatidan farqli o'laroq, bot qayta ishga tushsa ham o'chmaydi —
-            # shu tufayli "obuna bo'ling / telefon yuboring" bosqichida turgan
-            # foydalanuvchi referali deploy vaqtida yo'qolib qolmaydi.
+            # Har bir balans o'zgarishini yozib boradigan umumiy "bухgalteriya"
+            # jadvali — kunlik hisobot va foydalanuvchi tarixi shu yerdan olinadi.
+            # type: topup | purchase | referral_bonus | daily_bonus | admin_adjust
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS transactions (
+                    id         SERIAL PRIMARY KEY,
+                    user_id    BIGINT NOT NULL,
+                    type       TEXT NOT NULL,
+                    amount     BIGINT NOT NULL,
+                    note       TEXT DEFAULT '',
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_tx_created ON transactions (created_at)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_tx_user ON transactions (user_id)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_purchases_created ON purchases (created_at)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_created ON users (created_at)")
+            # Referal ID lar bot qayta ishga tushganda yo'qolib qolmasligi
+            # uchun vaqtinchalik saqlanadigan jadval (start_handler'da yoziladi,
+            # telefon tasdiqlanganda o'chiriladi).
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS pending_referrers (
                     user_id     BIGINT PRIMARY KEY,
@@ -153,6 +169,24 @@ class Database:
                 date_str, user_id
             )
 
+    # ─── PENDING REFERRERS (deploydan omon qoladigan referal xotira) ──
+    async def add_pending_referrer(self, user_id: int, referrer_id: int):
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO pending_referrers (user_id, referrer_id)
+                VALUES ($1, $2)
+                ON CONFLICT (user_id) DO UPDATE SET referrer_id = EXCLUDED.referrer_id
+            """, user_id, referrer_id)
+
+    async def get_pending_referrer(self, user_id: int):
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT referrer_id FROM pending_referrers WHERE user_id = $1", user_id)
+            return row["referrer_id"] if row else None
+
+    async def delete_pending_referrer(self, user_id: int):
+        async with self.pool.acquire() as conn:
+            await conn.execute("DELETE FROM pending_referrers WHERE user_id = $1", user_id)
+
     # ─── REFERRALS ─────────────────────────────────────────────
     async def add_referral(self, referrer_id: int, referred_id: int):
         async with self.pool.acquire() as conn:
@@ -168,13 +202,24 @@ class Database:
             )
 
     async def get_referral_earnings(self, user_id: int) -> int:
-        # Har bir referal uchun berilgan bonuslar yig'indisi
+        """Referal orqali haqiqatda yozib borilgan bonuslar yig'indisi (transactions dan)."""
         async with self.pool.acquire() as conn:
-            count = await conn.fetchval(
-                "SELECT COUNT(*) FROM referrals WHERE referrer_id = $1", user_id
+            val = await conn.fetchval(
+                "SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE user_id = $1 AND type = 'referral_bonus'",
+                user_id
             )
-            bonus = await self.get_setting("referral_bonus") or "500"
-            return count * int(bonus)
+            return int(val)
+
+    async def get_referrer_info(self, user_id: int):
+        """Foydalanuvchini kim taklif qilganini (referrer) topib beradi."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT ref.user_id AS ref_id, ref.fullname AS ref_fullname
+                FROM users u
+                JOIN users ref ON ref.user_id = u.referrer_id
+                WHERE u.user_id = $1
+            """, user_id)
+            return dict(row) if row else None
 
     # ─── PURCHASES ─────────────────────────────────────────────
     async def log_purchase(self, user_id: int, phone: str, country_code: str, country_name: str, price: int) -> int:
@@ -208,6 +253,8 @@ class Database:
                 FROM purchases p
                 JOIN users u ON u.user_id = p.user_id
                 WHERE p.phone = $1
+                ORDER BY p.created_at DESC
+                LIMIT 1
             """, phone)
             return dict(row) if row else None
 
@@ -265,25 +312,6 @@ class Database:
             rows = await conn.fetch("SELECT * FROM pending_payments ORDER BY created_at")
             return [dict(r) for r in rows]
 
-    # ─── PENDING REFERRERS (deploydan omon qoladi) ──────────────
-    async def add_pending_referrer(self, user_id: int, referrer_id: int):
-        async with self.pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO pending_referrers (user_id, referrer_id)
-                VALUES ($1, $2)
-                ON CONFLICT (user_id) DO UPDATE SET referrer_id = EXCLUDED.referrer_id
-            """, user_id, referrer_id)
-
-    async def get_pending_referrer(self, user_id: int):
-        async with self.pool.acquire() as conn:
-            return await conn.fetchval(
-                "SELECT referrer_id FROM pending_referrers WHERE user_id = $1", user_id
-            )
-
-    async def delete_pending_referrer(self, user_id: int):
-        async with self.pool.acquire() as conn:
-            await conn.execute("DELETE FROM pending_referrers WHERE user_id = $1", user_id)
-
     # ─── SETTINGS ──────────────────────────────────────────────
     async def get_setting(self, key: str):
         async with self.pool.acquire() as conn:
@@ -309,3 +337,50 @@ class Database:
                 INSERT INTO markup_prices (country_code, price) VALUES ($1, $2)
                 ON CONFLICT (country_code) DO UPDATE SET price = EXCLUDED.price
             """, country_code, price)
+
+    # ─── TRANSACTIONS (bухgalteriya kitobi) ────────────────────
+    async def log_transaction(self, user_id: int, type_: str, amount: int, note: str = ""):
+        """
+        Har qanday balans o'zgarishini yozib boradi.
+        type_: 'topup' | 'purchase' | 'referral_bonus' | 'daily_bonus' | 'admin_adjust'
+        amount: musbat yoki manfiy bo'lishi mumkin (masalan purchase => manfiy)
+        """
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO transactions (user_id, type, amount, note)
+                VALUES ($1, $2, $3, $4)
+            """, user_id, type_, amount, note)
+
+    async def get_daily_report(self, start_utc: datetime, end_utc: datetime) -> dict:
+        """Berilgan vaqt oralig'ida (UTC) turlar bo'yicha guruhlangan hisobot."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT type, COUNT(*) as cnt, COALESCE(SUM(amount), 0) as total
+                FROM transactions
+                WHERE created_at >= $1 AND created_at < $2
+                GROUP BY type
+            """, start_utc, end_utc)
+            return {r["type"]: {"count": r["cnt"], "total": int(r["total"])} for r in rows}
+
+    async def get_new_users_count(self, start_utc: datetime, end_utc: datetime) -> int:
+        async with self.pool.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT COUNT(*) FROM users WHERE created_at >= $1 AND created_at < $2",
+                start_utc, end_utc
+            )
+
+    async def get_user_tx_stats(self, user_id: int) -> dict:
+        """Foydalanuvchining to'lov/xarid tarixi bo'yicha yig'indi statistikasi."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT
+                    COUNT(*) FILTER (WHERE type = 'topup') AS topup_count,
+                    COALESCE(SUM(amount) FILTER (WHERE type = 'topup'), 0) AS topup_total,
+                    COUNT(*) FILTER (WHERE type = 'purchase') AS purchase_count,
+                    COALESCE(SUM(-amount) FILTER (WHERE type = 'purchase'), 0) AS purchase_total
+                FROM transactions
+                WHERE user_id = $1
+            """, user_id)
+            return dict(row) if row else {
+                "topup_count": 0, "topup_total": 0, "purchase_count": 0, "purchase_total": 0
+            }
