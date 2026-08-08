@@ -116,12 +116,102 @@ async def is_maintenance_mode() -> bool:
     val = await db.get_setting("maintenance_mode")
     return val == "1"
 
+UZ_CODE = "UZ"
+
+def sort_uz_first(items, key_func, reverse: bool = False):
+    """Har qanday saralashda O'zbekiston (+998 / UZ) doim ro'yxat boshida turadi,
+    qolgan davlatlar esa berilgan key_func bo'yicha saralanadi."""
+    items = list(items)
+    uz_items  = [(c, i) for c, i in items if c.upper() == UZ_CODE]
+    rest      = [(c, i) for c, i in items if c.upper() != UZ_CODE]
+    rest.sort(key=key_func, reverse=reverse)
+    return uz_items + rest
+
 def country_flag(code: str) -> str:
     """ISO-2 davlat kodidan bayroq emoji hosil qiladi (masalan UZ -> 🇺🇿)."""
     code = (code or "").strip().upper()
     if len(code) != 2 or not code.isalpha():
         return "🌍"
     return "".join(chr(0x1F1E6 + ord(c) - ord("A")) for c in code)
+
+# ─── PREMIUM (CUSTOM) EMOJI ─────────────────────────────────────
+# 2026-yil 9-fevral Bot API yangilanishidan buyon, agar botni
+# yaratgan akkaunt (@BotFather orqali) Telegram Premium obunasiga
+# ega bo'lsa, bot shaxsiy/guruh/superguruh chatlariga o'zi yuborayotgan
+# xabarlarda haqiqiy Premium (custom) emojilardan foydalanishi mumkin.
+#
+# MUHIM CHEKLOVLAR:
+#   1) Faqat XABAR MATNIDA ishlaydi (parse_mode=HTML) — tugma
+#      (inline/reply keyboard button) matnida hech qachon ishlamaydi.
+#   2) custom_emoji_id — bu real Premium emoji stikerining ID raqami,
+#      uni pastdagi /getemojiid (forward orqali) yoki /emojis
+#      buyrug'i yordamida olish mumkin.
+#   3) ID o'rnatilmagan slug uchun oddiy (fallback) emoji ko'rsatiladi
+#      — demak, Premium sozlanmagan bo'lsa ham bot normal ishlayveradi.
+
+PREMIUM_EMOJI_SLUGS = {
+    "welcome":   "👋",
+    "profile":   "👤",
+    "check":     "✅",
+    "cross":     "❌",
+    "money":     "💰",
+    "phone":     "📞",
+    "cart":      "🛒",
+    "gift":      "🎁",
+    "rocket":    "🚀",
+    "warn":      "⚠️",
+    "card":      "💳",
+    "admin":     "🔐",
+    "sparkle":   "✨",
+    "receipt":   "🧾",
+    "camera":    "📸",
+    "wallet":    "💼",
+    "clock":     "⏰",
+    "hourglass": "⏳",
+    "fire":      "🔥",
+    "chart":     "📊",
+    "globe":     "🌐",
+    "package":   "📦",
+    "key":       "🔑",
+    "support":   "🆘",
+    "guide":     "📕",
+    "referral":  "👥",
+    "link":      "🔗",
+    "point":     "👉",
+    "down":      "👇",
+    "shield":    "🛡",
+    "party":     "🎉",
+    "bell":      "🔔",
+    "star":      "⭐",
+    "bank":      "🏦",
+    "one":       "1️⃣",
+    "two":       "2️⃣",
+}
+
+PREMIUM_EMOJI_CACHE: dict[str, str] = {}
+
+async def reload_premium_emoji_cache():
+    """settings jadvalidan barcha o'rnatilgan custom_emoji_id larni xotiraga yuklaydi."""
+    global PREMIUM_EMOJI_CACHE
+    cache = {}
+    for slug in PREMIUM_EMOJI_SLUGS:
+        val = await db.get_setting(f"premium_emoji_{slug}")
+        if val:
+            cache[slug] = val
+    PREMIUM_EMOJI_CACHE = cache
+
+def E(slug: str) -> str:
+    """
+    Slug uchun, agar admin haqiqiy custom_emoji_id bog'lagan bo'lsa —
+    Premium emojini (<tg-emoji>) qaytaradi, aks holda oddiy fallback
+    emojini qaytaradi. FAQAT xabar matni ichida ishlating (tugmalarda
+    emas — Telegram tugma matnini HTML sifatida talqin qilmaydi).
+    """
+    fallback = PREMIUM_EMOJI_SLUGS.get(slug, "▫️")
+    custom_id = PREMIUM_EMOJI_CACHE.get(slug)
+    if custom_id:
+        return f'<tg-emoji emoji-id="{custom_id}">{fallback}</tg-emoji>'
+    return fallback
 
 def now_tashkent() -> datetime:
     return datetime.now(TASHKENT_TZ)
@@ -201,10 +291,10 @@ async def confirm_payment(pay_id: str, user_id: int, amount: int, fullname: str)
     try:
         await bot.send_message(
             user_id,
-            f"✅ <b>To'lovingiz tasdiqlandi!</b>\n\n"
-            f"💰 Hisobingizga <b>{amount:,} so'm</b> qo'shildi.\n"
-            f"💼 Joriy balans: <b>{user_balance:,} so'm</b>\n\n"
-            f"Endi xohlagan xizmatdan foydalanishingiz mumkin 🎉"
+            f"{E('check')} <b>To'lovingiz tasdiqlandi!</b>\n\n"
+            f"{E('money')} Hisobingizga <b>{amount:,} so'm</b> qo'shildi.\n"
+            f"{E('wallet')} Joriy balans: <b>{user_balance:,} so'm</b>\n\n"
+            f"Endi xohlagan xizmatdan foydalanishingiz mumkin {E('party')}"
         )
     except Exception:
         pass
@@ -213,11 +303,11 @@ async def confirm_payment(pay_id: str, user_id: int, amount: int, fullname: str)
     try:
         await bot.send_message(
             ADMIN_ID,
-            f"✅ To'lov tasdiqlandi!\n\n"
-            f"👤 {fullname} (<code>{user_id}</code>)\n"
-            f"💰 +{amount:,} so'm\n"
-            f"💼 Yangi balans: {user_balance:,} so'm\n"
-            f"⏰ {sav}"
+            f"{E('check')} To'lov tasdiqlandi!\n\n"
+            f"{E('profile')} {fullname} (<code>{user_id}</code>)\n"
+            f"{E('money')} +{amount:,} so'm\n"
+            f"{E('wallet')} Yangi balans: {user_balance:,} so'm\n"
+            f"{E('clock')} {sav}"
         )
     except Exception:
         pass
@@ -239,20 +329,25 @@ async def addbal_cmd(msg: Message):
     await db.log_transaction(uid, "topup", amount, note="admin_addbal")
     bal = await db.get_balance(uid)
     try:
-        await bot.send_message(uid, f"✅ Hisobingizga <b>{amount:,} so'm</b> qo'shildi!\n💼 Balans: <b>{bal:,} so'm</b>")
+        await bot.send_message(uid, f"{E('check')} Hisobingizga <b>{amount:,} so'm</b> qo'shildi!\n{E('wallet')} Balans: <b>{bal:,} so'm</b>")
     except Exception:
         pass
-    await msg.answer(f"✅ {user['fullname']} ga {amount:,} so'm qo'shildi.\n💼 Yangi balans: {bal:,} so'm")
+    await msg.answer(f"{E('check')} {user['fullname']} ga {amount:,} so'm qo'shildi.\n{E('wallet')} Yangi balans: {bal:,} so'm")
 
 # ══════════════════════════════════════════════════════════════
 #  HISOB TO'LDIRISH — foydalanuvchi chek yuboradi, admin tasdiqlaydi
 # ══════════════════════════════════════════════════════════════
 
 TOPUP_INTRO = (
-    "💳 <b>Hisob to'ldirish</b>\n\n"
-    "Necha so'mlik to'lov qilmoqchisiz? Faqat son yuboring (masalan: <code>50000</code>).\n\n"
-    "📌 Minimal: <b>1 000 so'm</b>\n"
-    "📌 Maksimal: <b>10 000 000 so'm</b>"
+    f"{E('card')} <b>Hisob to'ldirish</b>\n\n"
+    f"To'lov jarayoni juda oddiy — hammasi qo'lda, admin tomonidan tekshiriladi:\n\n"
+    f"{E('one')} Summani kiritasiz\n"
+    f"{E('two')} Ko'rsatilgan kartaga pul o'tkazasiz\n"
+    f"{E('camera')} Chek (skrinshot) rasmini yuborasiz\n"
+    f"{E('check')} Admin tasdiqlaydi — balansingiz to'ldiriladi ✅\n\n"
+    f"{E('sparkle')} Endi qancha to'lov qilmoqchi ekaningizni son ko'rinishida yozing (masalan: <code>50000</code>)\n\n"
+    f"{E('point')} Minimal: <b>1 000 so'm</b>\n"
+    f"{E('point')} Maksimal: <b>10 000 000 so'm</b>"
 )
 
 @router.message(F.text.func(is_cancel_text), StateFilter(PayStates.wait_amount, PayStates.wait_check))
@@ -268,7 +363,7 @@ async def pay_cancel_any(msg: Message, state: FSMContext):
 @router.message(F.text == "💳 Hisob to'ldirish")
 async def topup_menu(msg: Message, state: FSMContext):
     await msg.answer(
-        TOPUP_INTRO + "\n\n⚠️ Summani diqqat bilan tekshiring — botga tushgan mablag' qaytarilmaydi.\n"
+        TOPUP_INTRO + f"\n\n{E('warn')} Summani diqqat bilan tekshiring — botga tushgan mablag' qaytarilmaydi.\n"
         "Fikringizdan qaytsangiz, pastdagi «❌ Bekor qilish» tugmasini bosing.",
         reply_markup=cancel_kb
     )
@@ -284,10 +379,10 @@ async def pay_amount_received(msg: Message, state: FSMContext):
     amount = int(msg.text.strip())
     if not (1000 <= amount <= 10_000_000):
         await msg.answer(
-            "❌ Kiritilgan summa chegaradan tashqarida.\n"
-            "⬇️ Minimal: <b>1 000 so'm</b>\n"
-            "⬆️ Maksimal: <b>10 000 000 so'm</b>\n\n"
-            "Iltimos, to'g'ri summani qayta kiriting.",
+            f"{E('cross')} Kiritilgan summa chegaradan tashqarida.\n"
+            f"{E('point')} Minimal: <b>1 000 so'm</b>\n"
+            f"{E('point')} Maksimal: <b>10 000 000 so'm</b>\n\n"
+            f"Iltimos, to'g'ri summani qayta kiriting.",
             reply_markup=cancel_kb
         )
         return
@@ -309,12 +404,14 @@ async def pay_amount_received(msg: Message, state: FSMContext):
     ])
 
     await msg.answer(
-        f"💸 To'lov summasi: <b>{amount:,} so'm</b>\n"
-        f"💳 Karta raqami: <code>{card}</code>\n"
-        f"👤 Karta egasi: <b>{owner}</b>\n\n"
-        f"1️⃣ Yuqoridagi kartaga to'lovni amalga oshiring.\n"
-        f"2️⃣ To'lov chekining (skrinshot) rasmini shu yerga yuboring.\n\n"
-        f"⏰ <i>5 daqiqa ichida chek yuborilmasa, ushbu to'lov avtomatik bekor bo'ladi.</i>",
+        f"{E('receipt')} <b>To'lov ma'lumotlari</b>\n\n"
+        f"{E('money')} Summa: <b>{amount:,} so'm</b>\n"
+        f"{E('card')} Karta raqami: <code>{card}</code>\n"
+        f"{E('profile')} Karta egasi: <b>{owner}</b>\n\n"
+        f"{E('one')} Yuqoridagi kartaga ko'rsatilgan summani o'tkazing.\n"
+        f"{E('two')} To'lov chekining (skrinshot) rasmini shu yerga yuboring {E('camera')}\n\n"
+        f"{E('check')} Admin chekni ko'rib, tasdiqlashi bilan pul balansingizga tushadi.\n\n"
+        f"{E('hourglass')} <i>5 daqiqa ichida chek yuborilmasa, bu to'lov avtomatik bekor bo'ladi.</i>",
         reply_markup=kb
     )
 
@@ -329,8 +426,8 @@ async def _pay_timeout(pay_id: str, user_id: int, amount: int):
         try:
             await bot.send_message(
                 user_id,
-                f"⏰ <b>{amount:,} so'm</b>lik to'lovingiz uchun berilgan vaqt tugadi, shuning uchun bekor qilindi.\n"
-                f"Qayta urinish uchun «💳 Hisob to'ldirish» tugmasini bosing.",
+                f"{E('hourglass')} <b>{amount:,} so'm</b>lik to'lovingiz uchun berilgan vaqt tugadi, shuning uchun bekor qilindi.\n"
+                f"Qayta urinish uchun «{E('card')} Hisob to'ldirish» tugmasini bosing.",
                 reply_markup=main_menu
             )
         except Exception:
@@ -345,8 +442,8 @@ async def pay_check_received(msg: Message, state: FSMContext):
 
     if not pay:
         await msg.answer(
-            "❌ Bu to'lovning muddati tugagan yoki u bekor qilingan.\n"
-            "Qaytadan «💳 Hisob to'ldirish» tugmasini bosing.",
+            f"{E('cross')} Bu to'lovning muddati tugagan yoki u bekor qilingan.\n"
+            f"Qaytadan «{E('card')} Hisob to'ldirish» tugmasini bosing.",
             reply_markup=main_menu
         )
         await state.clear()
@@ -363,18 +460,19 @@ async def pay_check_received(msg: Message, state: FSMContext):
             ADMIN_ID,
             photo_id,
             caption=(
-                f"🧾 <b>Yangi to'lov cheki!</b>\n\n"
-                f"👤 {pay['fullname']} (<code>{pay['user_id']}</code>)\n"
-                f"💰 Miqdor: <b>{pay['amount']:,} so'm</b>"
+                f"{E('receipt')} <b>Yangi to'lov cheki!</b>\n\n"
+                f"{E('profile')} {pay['fullname']} (<code>{pay['user_id']}</code>)\n"
+                f"{E('money')} Miqdor: <b>{pay['amount']:,} so'm</b>"
             ),
             reply_markup=kb
         )
     except Exception:
-        await msg.answer("❌ Chekni yuborishda xatolik yuz berdi. Birozdan so'ng qayta urinib ko'ring.")
+        await msg.answer(f"{E('cross')} Chekni yuborishda xatolik yuz berdi. Birozdan so'ng qayta urinib ko'ring.")
         return
 
     await msg.answer(
-        "✅ Chekingiz adminga yuborildi. Tasdiqlanishini kuting — bu odatda uzoq davom etmaydi.",
+        f"{E('check')} Chekingiz qabul qilindi va adminga yuborildi!\n"
+        f"{E('hourglass')} Tasdiqlanishini kuting — bu odatda uzoq davom etmaydi {E('sparkle')}",
         reply_markup=main_menu
     )
     await state.clear()
@@ -382,7 +480,7 @@ async def pay_check_received(msg: Message, state: FSMContext):
 
 @router.message(PayStates.wait_check)
 async def pay_check_wrong_type(msg: Message):
-    await msg.answer("📸 Iltimos, to'lov chekining rasmini (skrinshotini) yuboring. Matn yoki fayl qabul qilinmaydi.")
+    await msg.answer(f"{E('camera')} Iltimos, to'lov chekining rasmini (skrinshotini) yuboring. Matn yoki fayl qabul qilinmaydi.")
 
 
 @admin_router.callback_query(F.data.startswith("pay_ok:"))
@@ -415,8 +513,8 @@ async def pay_no_cb(call: CallbackQuery):
     try:
         await bot.send_message(
             pay["user_id"],
-            f"❌ <b>{pay['amount']:,} so'm</b>lik to'lovingiz rad etildi.\n"
-            f"Xato deb hisoblasangiz, «🆘 Qo'llab-quvvatlash» orqali admin bilan bog'laning."
+            f"{E('cross')} <b>{pay['amount']:,} so'm</b>lik to'lovingiz rad etildi.\n"
+            f"Xato deb hisoblasangiz, «{E('support')} Qo'llab-quvvatlash» orqali admin bilan bog'laning."
         )
     except Exception:
         pass
@@ -464,12 +562,15 @@ async def get_sub_kb():
 
 def welcome_text(first_name: str) -> str:
     name = (first_name or "").strip()
-    hello = f"👋 Assalomu alaykum, <b>{name}</b>!" if name else "👋 Assalomu alaykum!"
+    hello = f"{E('welcome')} Assalomu alaykum, <b>{name}</b>! {E('sparkle')}" if name else f"{E('welcome')} Assalomu alaykum! {E('sparkle')}"
     return (
         f"{hello}\n\n"
-        f"Bu yerda siz Telegram uchun virtual raqam sotib olishingiz, "
-        f"hisobingizni to'ldirishingiz va do'stlaringizni taklif qilib pul ishlashingiz mumkin.\n\n"
-        f"Kerakli bo'limni pastdagi menyudan tanlang 👇"
+        f"Botimizga xush kelibsiz! Bu yerda siz:\n\n"
+        f"{E('phone')} Telegram uchun virtual raqamlar sotib olasiz\n"
+        f"{E('card')} Hisobingizni bir necha soniyada to'ldirasiz\n"
+        f"{E('referral')} Do'stlaringizni taklif qilib pul ishlaysiz\n"
+        f"{E('gift')} Har kuni bepul bonus olasiz\n\n"
+        f"Kerakli bo'limni pastdagi menyudan tanlang {E('down')}"
     )
 
 async def send_main(target, first_name: str = ""):
@@ -602,14 +703,14 @@ async def show_balance(msg: Message):
         user = await db.get_user(msg.from_user.id)
     purchases = await db.get_purchases(msg.from_user.id)
     text = (
-        f"👤 <b>Shaxsiy kabinetingiz</b>\n\n"
+        f"{E('profile')} <b>Shaxsiy kabinetingiz</b>\n\n"
         f"🆔 Tartib raqami: <b>{user['tartib_id']}</b>\n"
         f"🆔 Telegram ID: <code>{user['user_id']}</code>\n"
-        f"📱 Telefon: <code>{user['phone'] or 'Kiritilmagan'}</code>\n\n"
-        f"💰 Balans: <b>{user['balance']:,.0f} so'm</b>\n"
-        f"💵 Jami to'ldirilgan: <b>{user['total_deposited']:,.0f} so'm</b>\n"
-        f"🛒 Xaridlar soni: <b>{len(purchases)} ta</b>\n\n"
-        f"Hisobingizni to'ldirib, xizmatlardan bemalol foydalanishda davom eting ⚡"
+        f"{E('phone')} Telefon: <code>{user['phone'] or 'Kiritilmagan'}</code>\n\n"
+        f"{E('wallet')} Balans: <b>{user['balance']:,.0f} so'm</b>\n"
+        f"{E('money')} Jami to'ldirilgan: <b>{user['total_deposited']:,.0f} so'm</b>\n"
+        f"{E('cart')} Xaridlar soni: <b>{len(purchases)} ta</b>\n\n"
+        f"Hisobingizni to'ldirib, xizmatlardan bemalol foydalanishda davom eting {E('fire')}"
     )
     orders_channel = await get_setting("orders_channel_username", "")
     buttons = [[InlineKeyboardButton(text="💳 Hisob to'ldirish", callback_data="goto_topup")]]
@@ -630,7 +731,7 @@ async def build_countries_page(page: int):
         return None, 0
     countries        = data["countries"]
     filtered         = {k: v for k, v in countries.items() if k.upper() not in BLOCKED_COUNTRIES}
-    sorted_countries = sorted(filtered.items(), key=lambda x: float(x[1].get("price", 999)))
+    sorted_countries = sort_uz_first(filtered.items(), key_func=lambda x: float(x[1].get("price", 999)))
     markup_prices    = await db.get_all_markup_prices()
     total_pages      = (len(sorted_countries) - 1) // 10 + 1 if sorted_countries else 0
     start = page * 10
@@ -700,7 +801,7 @@ async def top10_countries(call: CallbackQuery):
         return await call.answer("❌ Ro'yxatni yuklab bo'lmadi.", show_alert=True)
     countries     = data["countries"]
     filtered      = {k: v for k, v in countries.items() if k.upper() not in BLOCKED_COUNTRIES}
-    sorted_c      = sorted(filtered.items(), key=lambda x: int(x[1].get("qty", 0)), reverse=True)[:10]
+    sorted_c      = sort_uz_first(filtered.items(), key_func=lambda x: int(x[1].get("qty", 0)), reverse=True)[:10]
     markup_prices = await db.get_all_markup_prices()
     buttons = []
     for code, info in sorted_c:
@@ -724,7 +825,7 @@ async def cheap_countries(call: CallbackQuery):
         return await call.answer("❌ Ro'yxatni yuklab bo'lmadi.", show_alert=True)
     countries     = data["countries"]
     filtered      = {k: v for k, v in countries.items() if k.upper() not in BLOCKED_COUNTRIES}
-    sorted_c      = sorted(filtered.items(), key=lambda x: float(x[1].get("price", 999)))[:10]
+    sorted_c      = sort_uz_first(filtered.items(), key_func=lambda x: float(x[1].get("price", 999)))[:10]
     markup_prices = await db.get_all_markup_prices()
     buttons = []
     for code, info in sorted_c:
@@ -973,12 +1074,12 @@ async def show_referral(call: CallbackQuery):
     earnings  = await db.get_referral_earnings(user_id)
     ref_bonus = int(await get_setting("referral_bonus", 500))
     text = (
-        f"👥 <b>Referal tizimi</b>\n\n"
-        f"🔗 Sizning shaxsiy referal havolangiz:\n<code>{ref_link}</code>\n\n"
-        f"👤 Taklif qilingan do'stlar: <b>{ref_count} ta</b>\n"
-        f"💰 Referaldan daromad: <b>{earnings:,} so'm</b>\n\n"
-        f"💡 Har bir taklif qilgan do'stingiz uchun <b>{ref_bonus:,} so'm</b> bonus olasiz!\n"
-        f"⚠️ Bonus faqat <b>+998</b> (O'zbekiston) raqamli foydalanuvchilar uchun beriladi."
+        f"{E('referral')} <b>Referal tizimi</b>\n\n"
+        f"{E('link')} Sizning shaxsiy referal havolangiz:\n<code>{ref_link}</code>\n\n"
+        f"{E('profile')} Taklif qilingan do'stlar: <b>{ref_count} ta</b>\n"
+        f"{E('money')} Referaldan daromad: <b>{earnings:,} so'm</b>\n\n"
+        f"{E('sparkle')} Har bir taklif qilgan do'stingiz uchun <b>{ref_bonus:,} so'm</b> bonus olasiz!\n"
+        f"{E('warn')} Bonus faqat <b>+998</b> (O'zbekiston) raqamli foydalanuvchilar uchun beriladi."
     )
     await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="back_earn")]
@@ -1011,24 +1112,24 @@ async def back_earn(call: CallbackQuery):
 @router.message(F.text == "📕 Qo'llanma")
 async def guide_menu(msg: Message):
     text = (
-        "<b>📕 Botdan foydalanish qo'llanmasi</b>\n\n"
-        "1️⃣ <b>📞 Nomer olish</b> — Telegram ro'yxatdan o'tish uchun virtual raqam sotib olasiz.\n"
-        "2️⃣ <b>🛒 Buyurtmalarim</b> — sotib olgan raqamlaringiz va ulardan kod olish shu yerda.\n"
-        "3️⃣ <b>💰 Hisobim</b> — joriy balansingiz va shaxsiy ma'lumotlaringiz.\n"
-        "4️⃣ <b>💳 Hisob to'ldirish</b> — bot hisobingizni pul bilan to'ldirasiz.\n"
-        "5️⃣ <b>💸 Pul ishlash</b> — do'stlaringizni taklif qilib yoki kunlik bonus orqali pul ishlaysiz.\n"
-        "6️⃣ <b>🆘 Qo'llab-quvvatlash</b> — savol yoki muammo bo'lsa, admin bilan bog'lanasiz.\n\n"
-        "Savollaringiz bo'lsa, «🆘 Qo'llab-quvvatlash» bo'limiga murojaat qiling."
+        f"<b>{E('guide')} Botdan foydalanish qo'llanmasi</b>\n\n"
+        f"1️⃣ <b>{E('phone')} Nomer olish</b> — Telegram ro'yxatdan o'tish uchun virtual raqam sotib olasiz.\n"
+        f"2️⃣ <b>{E('cart')} Buyurtmalarim</b> — sotib olgan raqamlaringiz va ulardan kod olish shu yerda.\n"
+        f"3️⃣ <b>{E('money')} Hisobim</b> — joriy balansingiz va shaxsiy ma'lumotlaringiz.\n"
+        f"4️⃣ <b>{E('card')} Hisob to'ldirish</b> — karta orqali qo'lda to'lov qilib, chek yuborasiz, admin tasdiqlaydi.\n"
+        f"5️⃣ <b>{E('referral')} Pul ishlash</b> — do'stlaringizni taklif qilib yoki kunlik bonus orqali pul ishlaysiz.\n"
+        f"6️⃣ <b>{E('support')} Qo'llab-quvvatlash</b> — savol yoki muammo bo'lsa, admin bilan bog'lanasiz.\n\n"
+        f"Savollaringiz bo'lsa, «{E('support')} Qo'llab-quvvatlash» bo'limiga murojaat qiling."
     )
     await msg.answer(text)
 
 @router.message(F.text == "🆘 Qo'llab-quvvatlash")
 async def support_menu(msg: Message):
     await msg.answer(
-        f"🆘 <b>Qo'llab-quvvatlash</b>\n\n"
+        f"{E('support')} <b>Qo'llab-quvvatlash</b>\n\n"
         f"Savol, muammo yoki taklifingiz bo'lsa, quyidagi havola orqali "
         f"to'g'ridan-to'g'ri adminga yozing:\n"
-        f"<a href='tg://user?id={ADMIN_ID}'>👤 Admin bilan bog'lanish</a>"
+        f"<a href='tg://user?id={ADMIN_ID}'>{E('profile')} Admin bilan bog'lanish</a>"
     )
 
 # ══════════════════════════════════════════════════════════════
@@ -1314,8 +1415,9 @@ async def price_single_start(call: CallbackQuery, state: FSMContext):
     countries     = data.get("countries", {})
     filtered      = {k: v for k, v in countries.items() if k.upper() not in BLOCKED_COUNTRIES}
     markup_prices = await db.get_all_markup_prices()
+    ordered = sort_uz_first(filtered.items(), key_func=lambda x: float(x[1].get("price", 999)))[:20]
     buttons = []
-    for code, info in list(filtered.items())[:20]:
+    for code, info in ordered:
         name  = info.get("name", code)
         flag  = country_flag(code)
         cur   = markup_prices.get(code.upper(), None)
@@ -1334,7 +1436,7 @@ async def price_list(call: CallbackQuery):
     filtered      = {k: v for k, v in countries.items() if k.upper() not in BLOCKED_COUNTRIES}
     markup_prices = await db.get_all_markup_prices()
     text = "📋 <b>Barcha davlatlar narxlari:</b>\n\n"
-    for code, info in sorted(filtered.items(), key=lambda x: float(x[1].get("price", 999))):
+    for code, info in sort_uz_first(filtered.items(), key_func=lambda x: float(x[1].get("price", 999))):
         name      = info.get("name", code)
         flag      = country_flag(code)
         usd_price = float(info.get("price", 1))
