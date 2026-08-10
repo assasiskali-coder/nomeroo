@@ -73,6 +73,11 @@ class AdminSettingsState(StatesGroup):
     wait_orders_channel_username = State()
     wait_card_number             = State()
     wait_card_owner              = State()
+    wait_exchange_rate           = State()
+    wait_default_margin          = State()
+
+class EmojiState(StatesGroup):
+    wait_forward = State()
 
 # ─── MENYULAR ──────────────────────────────────────────────────
 main_menu = ReplyKeyboardMarkup(
@@ -115,6 +120,31 @@ async def get_setting(key: str, default):
 async def is_maintenance_mode() -> bool:
     val = await db.get_setting("maintenance_mode")
     return val == "1"
+
+# ─── NARX HISOBLASH ────────────────────────────────────────────
+# Ilgari kurs (12500) va margin (1.3) kodga qattiq yozilgan edi — shuning
+# uchun admin foizni o'zgartirganda ba'zi davlatlar bir xil, ba'zilari
+# boshqacha "asos narx"dan hisoblanib, natija notekis ko'rinar edi.
+# Endi ikkalasi ham sozlamalarda saqlanadi va HAR DOIM shu yerdan olinadi —
+# shu bilan barcha davlatlar uchun bir xil formuladan foydalaniladi.
+DEFAULT_EXCHANGE_RATE = 12500
+DEFAULT_MARGIN        = 1.3
+MIN_PRICE_SOM         = 500
+
+async def get_exchange_rate() -> float:
+    return await get_setting("exchange_rate", DEFAULT_EXCHANGE_RATE)
+
+async def get_default_margin() -> float:
+    return await get_setting("default_margin", DEFAULT_MARGIN)
+
+async def calc_default_price(usd_price: float) -> int:
+    """Markup jadvalida narx sozlanmagan davlatlar uchun asos narxni hisoblaydi.
+    Kurs va margin sozlamalardan olinadi — shu bilan barcha davlatlar uchun
+    bitta izchil formula ishlatiladi."""
+    rate   = await get_exchange_rate()
+    margin = await get_default_margin()
+    price  = int(float(usd_price) * rate * margin)
+    return max(price, MIN_PRICE_SOM)
 
 UZ_CODE = "UZ"
 
@@ -215,6 +245,104 @@ def E(slug: str) -> str:
 
 def now_tashkent() -> datetime:
     return datetime.now(TASHKENT_TZ)
+
+# ─── PREMIUM EMOJI — ADMIN BUYRUQLARI ───────────────────────────
+# /emojis        — barcha slug (nom) larning holatini ko'rsatadi
+# /getemojiid    — admin Premium emoji yozilgan xabarni yuborsa/forward
+#                  qilsa, undagi custom_emoji_id larni chiqarib beradi
+# /setemoji slug id — slugni haqiqiy Premium emoji IDga bog'laydi
+# /unsetemoji slug  — bog'lanishni bekor qiladi (oddiy emojiga qaytaradi)
+
+@admin_router.message(F.text == "/emojis")
+async def emojis_list_cmd(msg: Message):
+    if msg.from_user.id != ADMIN_ID:
+        return
+    lines = [f"{E('sparkle')} <b>Premium emoji sozlamalari</b>\n"]
+    for slug, fallback in PREMIUM_EMOJI_SLUGS.items():
+        bound = PREMIUM_EMOJI_CACHE.get(slug)
+        status = f"✅ bog'langan (<code>{bound}</code>)" if bound else "▫️ oddiy emoji"
+        lines.append(f"{fallback} <code>{slug}</code> — {status}")
+    lines.append(
+        "\nQanday bog'lash kerak:\n"
+        "1️⃣ Premium emoji ishtirok etgan xabarni botga forward qiling yoki "
+        "<code>/getemojiid</code> yuboring, so'ng shu emojini o'z ichiga olgan xabarni yuboring.\n"
+        "2️⃣ Bot sizga o'sha emojining ID sini chiqaradi.\n"
+        "3️⃣ <code>/setemoji slug id</code> — masalan: <code>/setemoji money 5368324170671202286</code>\n"
+        "4️⃣ Bekor qilish uchun: <code>/unsetemoji slug</code>"
+    )
+    await msg.answer("\n".join(lines))
+
+
+@admin_router.message(F.text == "/getemojiid")
+async def getemojiid_start(msg: Message, state: FSMContext):
+    if msg.from_user.id != ADMIN_ID:
+        return
+    await msg.answer(
+        f"{E('camera')} Endi tarkibida Premium emoji bo'lgan xabarni menga yuboring "
+        f"(yozib yoki forward qilib) — men undagi barcha custom emoji ID larini chiqarib beraman.\n\n"
+        f"Bekor qilish uchun /cancel yozing."
+    )
+    await state.set_state(EmojiState.wait_forward)
+
+
+@admin_router.message(EmojiState.wait_forward)
+async def getemojiid_receive(msg: Message, state: FSMContext):
+    if msg.from_user.id != ADMIN_ID:
+        return
+    if is_cancel_text(msg.text):
+        await state.clear()
+        await msg.answer("❌ Amal bekor qilindi.")
+        return
+    entities = (msg.entities or []) + (msg.caption_entities or [])
+    custom = [e for e in entities if e.type == "custom_emoji"]
+    await state.clear()
+    if not custom:
+        await msg.answer(
+            f"{E('cross')} Bu xabarda Premium (custom) emoji topilmadi.\n"
+            f"Diqqat: oddiy emoji (👍😀 kabi) custom_emoji_id ga ega bo'lmaydi — "
+            f"faqat Telegram Premium orqali tanlanadigan maxsus emojilar mos keladi."
+        )
+        return
+    lines = [f"{E('check')} Topilgan Premium emoji ID lar:\n"]
+    for e in custom:
+        lines.append(f"<code>{e.custom_emoji_id}</code>")
+    lines.append(
+        f"\nBog'lash uchun: <code>/setemoji slug id</code>\n"
+        f"Mavjud sluglar ro'yxati uchun: /emojis"
+    )
+    await msg.answer("\n".join(lines))
+
+
+@admin_router.message(F.text.regexp(r'^/setemoji\s+\S+\s+\d+$'))
+async def setemoji_cmd(msg: Message):
+    if msg.from_user.id != ADMIN_ID:
+        return
+    parts = msg.text.strip().split()
+    slug, emoji_id = parts[1], parts[2]
+    if slug not in PREMIUM_EMOJI_SLUGS:
+        await msg.answer(
+            f"{E('cross')} Bunday slug topilmadi: <code>{slug}</code>\n"
+            f"Mavjud sluglarni ko'rish uchun: /emojis"
+        )
+        return
+    await db.set_setting(f"premium_emoji_{slug}", emoji_id)
+    await reload_premium_emoji_cache()
+    await msg.answer(f"{E('check')} <code>{slug}</code> muvaffaqiyatli bog'landi: {E(slug)}")
+
+
+@admin_router.message(F.text.regexp(r'^/unsetemoji\s+\S+$'))
+async def unsetemoji_cmd(msg: Message):
+    if msg.from_user.id != ADMIN_ID:
+        return
+    slug = msg.text.strip().split()[1]
+    if slug not in PREMIUM_EMOJI_SLUGS:
+        await msg.answer(f"{E('cross')} Bunday slug topilmadi: <code>{slug}</code>")
+        return
+    await db.set_setting(f"premium_emoji_{slug}", "")
+    await reload_premium_emoji_cache()
+    await msg.answer(f"{E('check')} <code>{slug}</code> uchun bog'lanish bekor qilindi, oddiy emojiga qaytdi.")
+
+
 
 def today_utc_bounds():
     """Toshkent vaqti bo'yicha 'bugun'ning UTC chegaralarini qaytaradi (naive UTC)."""
@@ -741,7 +869,7 @@ async def build_countries_page(page: int):
         qty       = info.get("qty", 0)
         name      = info.get("name", code)
         usd_price = float(info.get("price", 1))
-        uzs_price = markup_prices.get(code.upper()) or int(usd_price * 12500 * 1.3)
+        uzs_price = markup_prices.get(code.upper()) or await calc_default_price(usd_price)
         flag      = country_flag(code)
         buttons.append([InlineKeyboardButton(
             text=f"{name} {flag} — {uzs_price:,} so'm -| {qty} dona",
@@ -808,7 +936,7 @@ async def top10_countries(call: CallbackQuery):
         qty       = info.get("qty", 0)
         name      = info.get("name", code)
         usd_price = float(info.get("price", 1))
-        uzs_price = markup_prices.get(code.upper()) or int(usd_price * 12500 * 1.3)
+        uzs_price = markup_prices.get(code.upper()) or await calc_default_price(usd_price)
         flag      = country_flag(code)
         buttons.append([InlineKeyboardButton(
             text=f"{name} {flag} — {uzs_price:,} so'm -| {qty} dona",
@@ -832,7 +960,7 @@ async def cheap_countries(call: CallbackQuery):
         qty       = info.get("qty", 0)
         name      = info.get("name", code)
         usd_price = float(info.get("price", 1))
-        uzs_price = markup_prices.get(code.upper()) or int(usd_price * 12500 * 1.3)
+        uzs_price = markup_prices.get(code.upper()) or await calc_default_price(usd_price)
         flag      = country_flag(code)
         buttons.append([InlineKeyboardButton(
             text=f"{name} {flag} — {uzs_price:,} so'm -| {qty} dona",
@@ -1197,6 +1325,8 @@ async def admin_cmd(msg: Message):
         AdminSettingsState.wait_channel_username, AdminSettingsState.wait_price_value,
         AdminSettingsState.wait_orders_channel_id, AdminSettingsState.wait_orders_channel_username,
         AdminSettingsState.wait_card_number, AdminSettingsState.wait_card_owner,
+        AdminSettingsState.wait_exchange_rate, AdminSettingsState.wait_default_margin,
+        EmojiState.wait_forward,
     )
 )
 async def admin_cancel_any(msg: Message, state: FSMContext):
@@ -1398,14 +1528,80 @@ async def adm_balance_amount(msg: Message, state: FSMContext):
 async def adm_prices(call: CallbackQuery):
     if call.from_user.id != ADMIN_ID:
         return
+    rate   = await get_exchange_rate()
+    margin = await get_default_margin()
+    text = (
+        f"💵 <b>Narx sozlash</b>\n\n"
+        f"{E('chart')} Joriy kurs: <b>1$ = {rate:,.0f} so'm</b>\n"
+        f"{E('sparkle')} Joriy margin (ustama): <b>x{margin:g}</b>\n\n"
+        f"<i>Kurs va margin — narxi hali qo'lda sozlanmagan davlatlar uchun "
+        f"asos narx shu ikkalasidan hisoblanadi. Bu formula BARCHA davlatlar uchun "
+        f"bir xil ishlaydi, shu bilan foiz o'zgartirish hammasiga bir xilda ta'sir qiladi.</i>"
+    )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Bitta davlat narxini o'zgartirish",    callback_data="price_single")],
         [InlineKeyboardButton(text="📊 Barcha narxlarni % bilan o'zgartirish", callback_data="price_bulk")],
         [InlineKeyboardButton(text="📋 Barcha narxlarni ko'rish",              callback_data="price_list")],
+        [InlineKeyboardButton(text="💱 Kursni o'zgartirish",                   callback_data="set_exchange_rate")],
+        [InlineKeyboardButton(text="✨ Marginni o'zgartirish",                 callback_data="set_default_margin")],
         [InlineKeyboardButton(text="⬅️ Orqaga",                               callback_data="adm_refresh")],
     ])
-    await call.message.edit_text("💵 <b>Narx sozlash:</b>", reply_markup=kb)
+    await call.message.edit_text(text, reply_markup=kb)
     await call.answer()
+
+@admin_router.callback_query(F.data == "set_exchange_rate")
+async def set_exchange_rate_start(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return
+    rate = await get_exchange_rate()
+    await call.message.edit_text(
+        f"💱 Joriy kurs: <b>1$ = {rate:,.0f} so'm</b>\n\n"
+        f"Yangi kursni kiriting (masalan: <code>12800</code>):"
+    )
+    await state.set_state(AdminSettingsState.wait_exchange_rate)
+    await call.answer()
+
+@admin_router.message(AdminSettingsState.wait_exchange_rate)
+async def set_exchange_rate_apply(msg: Message, state: FSMContext):
+    if msg.from_user.id != ADMIN_ID:
+        return
+    try:
+        rate = float(msg.text.strip())
+        if rate <= 0:
+            raise ValueError
+    except Exception:
+        return await msg.answer("❌ Faqat musbat son kiriting, yoki /cancel yozing.")
+    await db.set_setting("exchange_rate", str(rate))
+    await msg.answer(f"{E('check')} Kurs yangilandi: 1$ = {rate:,.0f} so'm")
+    await state.clear()
+    await show_admin_panel(msg)
+
+@admin_router.callback_query(F.data == "set_default_margin")
+async def set_default_margin_start(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return
+    margin = await get_default_margin()
+    await call.message.edit_text(
+        f"✨ Joriy margin: <b>x{margin:g}</b>\n\n"
+        f"Yangi marginni kiriting (masalan <code>1.3</code> — 30% ustama demakdir):"
+    )
+    await state.set_state(AdminSettingsState.wait_default_margin)
+    await call.answer()
+
+@admin_router.message(AdminSettingsState.wait_default_margin)
+async def set_default_margin_apply(msg: Message, state: FSMContext):
+    if msg.from_user.id != ADMIN_ID:
+        return
+    try:
+        margin = float(msg.text.strip())
+        if margin <= 0:
+            raise ValueError
+    except Exception:
+        return await msg.answer("❌ Faqat musbat son kiriting, yoki /cancel yozing.")
+    await db.set_setting("default_margin", str(margin))
+    await msg.answer(f"{E('check')} Margin yangilandi: x{margin:g}")
+    await state.clear()
+    await show_admin_panel(msg)
 
 @admin_router.callback_query(F.data == "price_single")
 async def price_single_start(call: CallbackQuery, state: FSMContext):
@@ -1440,7 +1636,7 @@ async def price_list(call: CallbackQuery):
         name      = info.get("name", code)
         flag      = country_flag(code)
         usd_price = float(info.get("price", 1))
-        uzs_price = markup_prices.get(code.upper()) or int(usd_price * 12500 * 1.3)
+        uzs_price = markup_prices.get(code.upper()) or await calc_default_price(usd_price)
         text += f"🌍 {name} {flag} (<code>{code}</code>): <b>{uzs_price:,} so'm</b>\n"
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Orqaga", callback_data="adm_prices")]])
     await call.message.edit_text(text, reply_markup=kb)
@@ -1467,18 +1663,34 @@ async def price_bulk_apply(msg: Message, state: FSMContext):
         percent = float(msg.text)
     except Exception:
         return await msg.answer("❌ Faqat son kiriting, yoki bekor qilish uchun /cancel yozing.")
+    if percent <= -100:
+        return await msg.answer("❌ Foiz -100 dan katta bo'lishi kerak (masalan -50).")
     data      = await api_available_countries()
     countries = data.get("countries", {})
-    filtered  = {k: v for k, v in countries.items() if k.upper() not in BLOCKED_COUNTRIES}
+    if not countries:
+        await msg.answer(
+            f"{E('warn')} Davlatlar ro'yxatini API dan olib bo'lmadi, shuning uchun "
+            f"narxlar o'zgartirilmadi. Birozdan so'ng qayta urinib ko'ring."
+        )
+        await state.clear()
+        return
+    filtered      = {k: v for k, v in countries.items() if k.upper() not in BLOCKED_COUNTRIES}
     markup_prices = await db.get_all_markup_prices()
-    updated = 0
+    updated, skipped = 0, 0
     for code, info in filtered.items():
-        usd_price = float(info.get("price", 1))
-        cur_price = markup_prices.get(code.upper()) or int(usd_price * 12500 * 1.3)
-        new_price = int(cur_price * (1 + percent / 100))
-        await db.set_markup_price(code.upper(), new_price)
-        updated += 1
-    await msg.answer(f"✅ {updated} ta davlat narxi {percent:+.0f}% ga o'zgartirildi!")
+        try:
+            usd_price = float(info.get("price", 1))
+            cur_price = markup_prices.get(code.upper()) or await calc_default_price(usd_price)
+            new_price = max(int(cur_price * (1 + percent / 100)), MIN_PRICE_SOM)
+            await db.set_markup_price(code.upper(), new_price)
+            updated += 1
+        except Exception:
+            skipped += 1
+            continue
+    result_text = f"{E('check')} {updated} ta davlat narxi {percent:+.0f}% ga o'zgartirildi!"
+    if skipped:
+        result_text += f"\n{E('warn')} {skipped} ta davlat narxli ma'lumoti noto'g'ri bo'lgani uchun o'tkazib yuborildi."
+    await msg.answer(result_text)
     await state.clear()
     await show_admin_panel(msg)
 
@@ -1499,6 +1711,8 @@ async def setprice_amount(msg: Message, state: FSMContext):
     if not msg.text or not msg.text.isdigit():
         return await msg.answer("❌ Faqat son kiriting, yoki bekor qilish uchun /cancel yozing.")
     price = int(msg.text)
+    if price < MIN_PRICE_SOM:
+        return await msg.answer(f"❌ Narx kamida {MIN_PRICE_SOM:,} so'm bo'lishi kerak.")
     data  = await state.get_data()
     code  = data['country']
     await db.set_markup_price(code.upper(), price)
@@ -1517,6 +1731,7 @@ async def adm_settings(call: CallbackQuery):
     orders_ch_un    = await get_setting("orders_channel_username", "")
     card            = await get_setting("card_number", CARD_NUMBER)
     owner           = await get_setting("card_owner", CARD_OWNER)
+    bound_count = sum(1 for v in PREMIUM_EMOJI_CACHE.values() if v)
     text = (
         f"⚙️ <b>Bot sozlamalari</b>\n\n"
         f"🎁 Kunlik bonus: <b>{daily_bonus_val} so'm</b>\n"
@@ -1524,7 +1739,8 @@ async def adm_settings(call: CallbackQuery):
         f"📢 Majburiy kanal: <b>@{channel_un}</b>\n"
         f"📦 Buyurtmalar kanali: <b>@{orders_ch_un or 'Sozlanmagan'}</b>\n"
         f"💳 Karta raqami: <b>{card}</b>\n"
-        f"👤 Karta egasi: <b>{owner}</b>"
+        f"👤 Karta egasi: <b>{owner}</b>\n"
+        f"{E('sparkle')} Premium emoji: <b>{bound_count}/{len(PREMIUM_EMOJI_SLUGS)}</b> bog'langan"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎁 Kunlik bonusni o'zgartirish",   callback_data="set_daily_bonus")],
@@ -1533,9 +1749,30 @@ async def adm_settings(call: CallbackQuery):
         [InlineKeyboardButton(text="📦 Buyurtmalar kanalini sozlash",  callback_data="set_orders_channel")],
         [InlineKeyboardButton(text="💳 Karta raqamini o'zgartirish",   callback_data="set_card_number")],
         [InlineKeyboardButton(text="👤 Karta egasini o'zgartirish",    callback_data="set_card_owner")],
+        [InlineKeyboardButton(text="✨ Premium emoji sozlash",         callback_data="adm_emojis")],
         [InlineKeyboardButton(text="⬅️ Orqaga",                       callback_data="adm_refresh")],
     ])
     await call.message.edit_text(text, reply_markup=kb)
+    await call.answer()
+
+@admin_router.callback_query(F.data == "adm_emojis")
+async def adm_emojis_cb(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    lines = [f"{E('sparkle')} <b>Premium emoji sozlamalari</b>\n"]
+    for slug, fallback in PREMIUM_EMOJI_SLUGS.items():
+        bound = PREMIUM_EMOJI_CACHE.get(slug)
+        status = f"✅ bog'langan (<code>{bound}</code>)" if bound else "▫️ oddiy emoji"
+        lines.append(f"{fallback} <code>{slug}</code> — {status}")
+    lines.append(
+        "\n<b>Qanday bog'lash kerak:</b>\n"
+        "1️⃣ /getemojiid buyrug'ini yuboring\n"
+        "2️⃣ Premium emoji bor xabarni yuboring/forward qiling\n"
+        "3️⃣ Bot ID beradi — <code>/setemoji slug id</code> bilan bog'lang\n"
+        "4️⃣ Bekor qilish: <code>/unsetemoji slug</code>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Orqaga", callback_data="adm_settings")]])
+    await call.message.edit_text("\n".join(lines), reply_markup=kb)
     await call.answer()
 
 @admin_router.callback_query(F.data == "set_daily_bonus")
@@ -1711,6 +1948,7 @@ async def broadcast_send(msg: Message, state: FSMContext):
 # ─── ISHGA TUSHIRISH ───────────────────────────────────────────
 async def main():
     await db.init()
+    await reload_premium_emoji_cache()
     dp.include_router(admin_router)
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
